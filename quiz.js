@@ -44,6 +44,14 @@ module.exports = function (app, connectDB) {
             const quiz = await db.collection('quizzes').findOne({ _id: new ObjectId(id) });
             if (!quiz) return res.status(404).json({ success: false, message: 'Quiz not found' });
 
+            // Attach quizStartTime from linked hackathon if present
+            if (!quiz.quizStartTime) {
+                const linkedHackathon = await db.collection('hackathons').findOne({ linkedQuizId: id });
+                if (linkedHackathon && linkedHackathon.quizStartTime) {
+                    quiz.quizStartTime = linkedHackathon.quizStartTime;
+                }
+            }
+
             res.status(200).json({ success: true, data: quiz });
         } catch (error) {
             console.error('Error fetching quiz:', error);
