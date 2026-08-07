@@ -215,6 +215,9 @@ app.put('/api/hackathons/:id/status', async (req, res) => {
         if (winner !== undefined) updateData.winner = winner;
         if (secondWinner !== undefined) updateData.secondWinner = secondWinner;
         if (raffleWinners !== undefined) updateData.raffleWinners = raffleWinners;
+        if (status === 'completed') {
+            updateData.isHidden = false;
+        }
 
         const result = await db.collection('hackathons').updateOne(
             { _id: new ObjectId(id) },

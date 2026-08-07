@@ -128,6 +128,7 @@ module.exports = function (app, connectDB) {
                     secondWinner: secondWinner || '',
                     raffleWinners: raffleWinners || '',
                     participantsCount: participantsCount,
+                    isHidden: false,
                     updatedAt: new Date()
                 } }
             );
