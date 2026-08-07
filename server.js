@@ -1,3 +1,15 @@
+// DNS Loopback Fallback for Windows local development environments
+const dns = require('dns');
+try {
+    const servers = dns.getServers();
+    if (servers.length === 0 || servers.includes('127.0.0.1')) {
+        dns.setServers(['8.8.8.8', '1.1.1.1', ...servers.filter(s => s !== '127.0.0.1')]);
+        console.log("DNS servers overridden to Google/Cloudflare resolvers to avoid querySrv ECONNREFUSED.");
+    }
+} catch (e) {
+    console.warn("Could not check or set DNS servers:", e.message);
+}
+
 const express = require('express');
 const cors = require('cors');
 const { MongoClient, ObjectId } = require('mongodb');
