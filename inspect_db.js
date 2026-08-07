@@ -20,6 +20,10 @@ async function run() {
         await client.connect();
         const dbName = process.env.DB_NAME || 'nexbyteind_db_user';
         const db = client.db(dbName);
+        console.log("Updating completed events to isHidden: false...");
+        const updateRes = await db.collection('hackathons').updateMany({ status: 'completed' }, { $set: { isHidden: false } });
+        console.log(`Updated ${updateRes.modifiedCount} completed events.`);
+
         const hackathons = await db.collection('hackathons').find({}).toArray();
         console.log("ALL HACKATHONS/QUIZZES:");
         hackathons.forEach(h => {
