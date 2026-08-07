@@ -46,12 +46,19 @@ module.exports = function (app, connectDB) {
             const quiz = await db.collection('quizzes').findOne({ _id: new ObjectId(id) });
             if (!quiz) return res.status(404).json({ success: false, message: 'Quiz not found' });
 
-            // Attach quizStartTime from linked hackathon if present
-            if (!quiz.quizStartTime) {
-                const linkedHackathon = await db.collection('hackathons').findOne({ linkedQuizId: id });
-                if (linkedHackathon && linkedHackathon.quizStartTime) {
+            // Attach quizStartTime and other metadata from linked hackathon if present
+            const linkedHackathon = await db.collection('hackathons').findOne({ linkedQuizId: id });
+            if (linkedHackathon) {
+                if (!quiz.quizStartTime && linkedHackathon.quizStartTime) {
                     quiz.quizStartTime = linkedHackathon.quizStartTime;
                 }
+                if (!quiz.description || quiz.description.trim() === "") {
+                    quiz.description = linkedHackathon.description || "";
+                }
+                quiz.benefits = linkedHackathon.benefits || "";
+                quiz.techStack = linkedHackathon.techStack || "";
+                quiz.prizeMoney = linkedHackathon.prizeMoney || "";
+                quiz.mode = linkedHackathon.mode || "";
             }
 
             res.status(200).json({ success: true, data: quiz });
