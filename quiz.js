@@ -12,6 +12,8 @@ module.exports = function (app, connectDB) {
                 companyLink: req.body.companyLink,
                 isTimed: req.body.isTimed,
                 durationMinutes: parseInt(req.body.durationMinutes) || 0,
+                description: req.body.description || "",
+                brokers: Array.isArray(req.body.brokers) ? req.body.brokers : [],
                 questions: req.body.questions || [], // Array of { question, options: [string], correctAnswer: string }
                 createdAt: new Date()
             };
@@ -72,6 +74,8 @@ module.exports = function (app, connectDB) {
                 companyLink: req.body.companyLink,
                 isTimed: req.body.isTimed,
                 durationMinutes: parseInt(req.body.durationMinutes) || 0,
+                description: req.body.description || "",
+                brokers: Array.isArray(req.body.brokers) ? req.body.brokers : [],
                 questions: req.body.questions || [],
                 updatedAt: new Date()
             };
@@ -168,6 +172,7 @@ module.exports = function (app, connectDB) {
                 totalTimeSeconds: parseInt(req.body.totalTimeSeconds) || 0,
                 avgTimePerQuestion: parseFloat(req.body.avgTimePerQuestion) || 0,
                 timePerQuestion: Array.isArray(req.body.timePerQuestion) ? req.body.timePerQuestion : [],
+                referralSource: req.body.referralSource || "",
                 submittedAt: new Date()
             };
 
