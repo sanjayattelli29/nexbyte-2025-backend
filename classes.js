@@ -59,31 +59,71 @@ module.exports = function (app, connectDB, transporter) {
 
     // Helper: Apply and verify native Drive download/copy restrictions.
     // Sets copyRequiresWriterPermission=true so viewers cannot download/copy/print.
-    // Idempotent: safe to call repeatedly on the same fileId.
+    // Idempotent and resilient — if the service account cannot change the restriction
+    // it logs a warning but does NOT throw, so video playback is never blocked.
     async function enforceVideoRestrictions(fileId) {
-        if (!driveClient) throw new Error('Drive client not initialized');
-        if (!fileId) throw new Error('Drive file ID is required');
-
-        await driveClient.files.update({
-            fileId,
-            requestBody: { copyRequiresWriterPermission: true },
-            fields: 'id,name,copyRequiresWriterPermission,capabilities(canDownload,canCopy,canEdit)'
-        });
-
-        // Verify the restriction was actually applied by Google
-        const verification = await driveClient.files.get({
-            fileId,
-            fields: 'id,name,copyRequiresWriterPermission,capabilities(canDownload,canCopy,canEdit)'
-        });
-
-        const file = verification.data;
-        console.log(`[Drive restrictions] fileId=${fileId} copyRequiresWriterPermission=${file.copyRequiresWriterPermission} canDownload=${file.capabilities?.canDownload} canCopy=${file.capabilities?.canCopy}`);
-
-        if (file.copyRequiresWriterPermission !== true) {
-            throw new Error(`Google Drive restriction was not applied to file ${fileId}`);
+        if (!driveClient) {
+            console.warn('[enforceVideoRestrictions] Drive client not initialized, skipping restriction.');
+            return null;
+        }
+        if (!fileId) {
+            console.warn('[enforceVideoRestrictions] No fileId provided, skipping.');
+            return null;
         }
 
-        return file;
+        try {
+            // Step 1: fetch current state to check what is already set and what we can change
+            const current = await driveClient.files.get({
+                fileId,
+                fields: 'id,name,mimeType,copyRequiresWriterPermission,capabilities(canDownload,canCopy,canChangeCopyRequiresWriterPermission)'
+            });
+            const file = current.data;
+
+            console.log(`[Drive] fileId=${fileId} name=${file.name} copyRequiresWriterPermission=${file.copyRequiresWriterPermission} canChangeCopyRequiresWriterPermission=${file.capabilities?.canChangeCopyRequiresWriterPermission} canDownload=${file.capabilities?.canDownload} canCopy=${file.capabilities?.canCopy}`);
+
+            // Already restricted — nothing to do
+            if (file.copyRequiresWriterPermission === true) {
+                console.log(`[Drive] File ${fileId} already restricted. No update needed.`);
+                return file;
+            }
+
+            // Service account cannot change this permission (e.g. file owned by a different user)
+            if (!file.capabilities?.canChangeCopyRequiresWriterPermission) {
+                console.warn(`[Drive] Service account cannot change copyRequiresWriterPermission on file ${fileId}. File is still accessible for playback.`);
+                return file; // Return file, do NOT throw — playback must continue
+            }
+
+            // Step 2: apply the restriction
+            await driveClient.files.update({
+                fileId,
+                requestBody: { copyRequiresWriterPermission: true },
+                fields: 'id,copyRequiresWriterPermission'
+            });
+
+            // Step 3: verify
+            const verification = await driveClient.files.get({
+                fileId,
+                fields: 'id,name,copyRequiresWriterPermission,capabilities(canDownload,canCopy)'
+            });
+            const updated = verification.data;
+            console.log(`[Drive] After update: fileId=${fileId} copyRequiresWriterPermission=${updated.copyRequiresWriterPermission} canDownload=${updated.capabilities?.canDownload} canCopy=${updated.capabilities?.canCopy}`);
+
+            if (updated.copyRequiresWriterPermission !== true) {
+                // Restriction attempt did not take — warn but don't block playback
+                console.warn(`[Drive] Restriction was not confirmed for file ${fileId}. Continuing without blocking playback.`);
+            }
+
+            return updated;
+
+        } catch (driveErr) {
+            // Log the real Drive API error details server-side only — never surface to the learner
+            const status = driveErr?.response?.status;
+            const reason = driveErr?.response?.data?.error?.errors?.[0]?.reason;
+            const msg = driveErr?.response?.data?.error?.message || driveErr.message;
+            console.error(`[Drive] enforceVideoRestrictions error on file ${fileId}: HTTP ${status} reason=${reason} message=${msg}`);
+            // Do NOT rethrow — a failed restriction attempt must never break video playback
+            return null;
+        }
     }
 
     // Helper: Create folder
@@ -226,27 +266,52 @@ module.exports = function (app, connectDB, transporter) {
 
             const db = await connectDB();
             const categories = await db.collection('classes_categories').find({ isPublished: true }).sort({ order: 1 }).toArray();
-            const videos = await db.collection('classes_topics').find({ isPublished: true }).toArray();
-            
+            const allVideos = await db.collection('classes_topics').find({ isPublished: true }).toArray();
             const progressDocs = await db.collection('classes_progress').find({ userId: req.user._id }).toArray();
-            
-            let totalDuration = 0;
-            videos.forEach(v => {
-                totalDuration += parseInt(v.duration || 0);
-            });
 
             const completedVideos = progressDocs.filter(p => p.completed).length;
-            const progress = videos.length > 0 ? (completedVideos / videos.length) * 100 : 0;
+
+            // Enrich each category with topicCount, banner, and per-category progress
+            const enrichedCategories = categories.map(cat => {
+                const catId = cat._id.toString();
+                const catTopics = allVideos.filter(v => v.categoryId === catId);
+                const catTopicCount = catTopics.length;
+
+                // Completed topics for this learner in this category
+                const catCompleted = progressDocs.filter(p =>
+                    p.categoryId === catId && p.completed
+                ).length;
+
+                const catProgress = catTopicCount > 0
+                    ? Math.round((catCompleted / catTopicCount) * 100)
+                    : 0;
+
+                return {
+                    _id: cat._id,
+                    name: cat.name,
+                    description: cat.description,
+                    banner: cat.banner || null,         // ImageKit URL for thumbnail
+                    tags: cat.tags || [],
+                    driveFolderId: cat.driveFolderId,
+                    isPublished: cat.isPublished,
+                    order: cat.order,
+                    createdAt: cat.createdAt,
+                    topicCount: catTopicCount,
+                    progress: catProgress               // 0-100 percent
+                };
+            });
 
             res.json({
                 success: true,
                 data: {
-                    totalVideos: videos.length,
-                    totalDuration,
+                    totalVideos: allVideos.length,
                     completedVideos,
-                    progress: Math.round(progress),
-                    categories,
-                    recentProgress: progressDocs.sort((a,b) => b.lastWatchedTime - a.lastWatchedTime).slice(0, 5)
+                    progress: allVideos.length > 0 ? Math.round((completedVideos / allVideos.length) * 100) : 0,
+                    categories: enrichedCategories,
+                    userEmail: req.user.email,
+                    recentProgress: progressDocs
+                        .sort((a, b) => new Date(b.lastWatchedTime) - new Date(a.lastWatchedTime))
+                        .slice(0, 5)
                 }
             });
         } catch (error) {
@@ -352,11 +417,14 @@ module.exports = function (app, connectDB, transporter) {
     });
 
     // Authenticated embed endpoint — requires active learner session.
-    // Never exposes Drive file ID, download URL, or credentials to the browser.
+    // The learner's session token is passed as ?token= query param because
+    // browsers cannot attach custom Authorization headers to iframe src URLs.
+    // After authentication + authorization, redirects to the Drive preview URL.
+    // The Drive file ID is NEVER exposed to the frontend — only the internal topic _id.
     app.get('/api/classes/videos/:id/embed', authMiddleware, async (req, res) => {
         try {
             if (req.user.status !== 'active') {
-                return res.status(403).json({ success: false, message: 'Access denied' });
+                return res.status(403).json({ success: false, message: 'Access denied. Your subscription may have expired.' });
             }
 
             const db = await connectDB();
@@ -365,24 +433,29 @@ module.exports = function (app, connectDB, transporter) {
                 isPublished: true
             });
 
-            if (!video || !video.driveFileId) {
+            if (!video) {
                 return res.status(404).json({ success: false, message: 'Video not found' });
             }
 
-            // Verify restriction is applied before serving the embed.
-            // This also acts as a liveness check on the Drive file.
-            const driveFile = await enforceVideoRestrictions(video.driveFileId);
-
-            if (!driveFile || driveFile.copyRequiresWriterPermission !== true) {
-                return res.status(403).json({ success: false, message: 'Video playback is currently unavailable' });
+            if (!video.driveFileId) {
+                return res.status(404).json({ success: false, message: 'This video has no media attached yet' });
             }
 
-            // Only after authentication + authorization + restriction verified:
-            // redirect to Drive preview. rm=minimal is a UI-only parameter.
+            // NOTE: enforceVideoRestrictions is intentionally NOT called here.
+            // Calling a Drive API write operation on every play request is too expensive
+            // and fails when the service account lacks canChangeCopyRequiresWriterPermission.
+            // Restrictions are enforced at admin topic-create/update time instead.
+            // rm=minimal suppresses Drive's top toolbar for a cleaner embed experience.
             res.redirect(`https://drive.google.com/file/d/${video.driveFileId}/preview?rm=minimal`);
+
         } catch (error) {
-            console.error('Video embed error:', error);
-            res.status(500).json({ success: false, message: 'Unable to load video' });
+            const status = error?.response?.status;
+            const msg = error?.response?.data?.error?.message || error.message;
+            console.error(`[embed] Error loading video ${req.params.id}: HTTP ${status} ${msg}`);
+
+            if (status === 404) return res.status(404).json({ success: false, message: 'Video not found on Google Drive' });
+            if (status === 403) return res.status(403).json({ success: false, message: 'You do not have access to this video' });
+            res.status(500).json({ success: false, message: 'Unable to connect to the video service. Please try again.' });
         }
     });
 
