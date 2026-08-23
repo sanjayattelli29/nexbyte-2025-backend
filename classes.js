@@ -274,9 +274,35 @@ module.exports = function (app, connectDB, transporter) {
                 .sort({ order: 1 })
                 .toArray();
 
-            res.json({ success: true, data: { video, comments, remainingTopics: categoryTopics } });
+            res.json({ 
+                success: true, 
+                data: { 
+                    video, 
+                    comments, 
+                    remainingTopics: categoryTopics,
+                    userEmail: req.user.email 
+                } 
+            });
         } catch (e) {
+            console.error(e);
             res.status(500).json({ success: false, message: 'Server error' });
+        }
+    });
+
+    // Embed endpoint to hide raw Drive URL from React UI
+    app.get('/api/classes/videos/:id/embed', async (req, res) => {
+        try {
+            // We can optionally verify a token via query parameter if we want stricter security, 
+            // but for simple obfuscation we just fetch the ID and redirect.
+            const db = await connectDB();
+            const video = await db.collection('classes_topics').findOne({ _id: new ObjectId(req.params.id) });
+            if (!video || !video.isPublished || !video.driveFileId) {
+                return res.status(404).send('Video not found');
+            }
+            // Redirect to Google Drive preview URL
+            res.redirect(`https://drive.google.com/file/d/${video.driveFileId}/preview`);
+        } catch (e) {
+            res.status(500).send('Server error');
         }
     });
 
