@@ -299,8 +299,9 @@ module.exports = function (app, connectDB, transporter) {
             if (!video || !video.isPublished || !video.driveFileId) {
                 return res.status(404).send('Video not found');
             }
-            // Redirect to Google Drive preview URL
-            res.redirect(`https://drive.google.com/file/d/${video.driveFileId}/preview`);
+            // Redirect to Google Drive preview URL.
+            // ?rm=minimal suppresses the Drive viewer top toolbar (pop-out, share, etc.)
+            res.redirect(`https://drive.google.com/file/d/${video.driveFileId}/preview?rm=minimal`);
         } catch (e) {
             res.status(500).send('Server error');
         }
