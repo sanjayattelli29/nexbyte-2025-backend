@@ -58,10 +58,10 @@ module.exports = function (app, connectDB, transporter) {
     }
 
     // Helper: Apply and verify native Drive download/copy restrictions.
-    // Sets copyRequiresWriterPermission=true so viewers cannot download/copy/print.
+    // Sets copyRequiresWriterPermission=disableDownload (default true) so viewers cannot download/copy/print.
     // Idempotent and resilient — if the service account cannot change the restriction
     // it logs a warning but does NOT throw, so video playback is never blocked.
-    async function enforceVideoRestrictions(fileId) {
+    async function enforceVideoRestrictions(fileId, disableDownload = true) {
         if (!driveClient) {
             console.warn('[enforceVideoRestrictions] Drive client not initialized, skipping restriction.');
             return null;
@@ -71,6 +71,8 @@ module.exports = function (app, connectDB, transporter) {
             return null;
         }
 
+        const boolValue = !!disableDownload;
+
         try {
             // Step 1: fetch current state to check what is already set and what we can change
             const current = await driveClient.files.get({
@@ -79,11 +81,11 @@ module.exports = function (app, connectDB, transporter) {
             });
             const file = current.data;
 
-            console.log(`[Drive] fileId=${fileId} name=${file.name} copyRequiresWriterPermission=${file.copyRequiresWriterPermission} canChangeCopyRequiresWriterPermission=${file.capabilities?.canChangeCopyRequiresWriterPermission} canDownload=${file.capabilities?.canDownload} canCopy=${file.capabilities?.canCopy}`);
+            console.log(`[Drive] fileId=${fileId} name=${file.name} copyRequiresWriterPermission=${file.copyRequiresWriterPermission} canChangeCopyRequiresWriterPermission=${file.capabilities?.canChangeCopyRequiresWriterPermission} canDownload=${file.capabilities?.canDownload} canCopy=${file.capabilities?.canCopy} targetValue=${boolValue}`);
 
-            // Already restricted — nothing to do
-            if (file.copyRequiresWriterPermission === true) {
-                console.log(`[Drive] File ${fileId} already restricted. No update needed.`);
+            // Already matches desired state — nothing to do
+            if (file.copyRequiresWriterPermission === boolValue) {
+                console.log(`[Drive] File ${fileId} already has restriction set to ${boolValue}. No update needed.`);
                 return file;
             }
 
@@ -96,7 +98,7 @@ module.exports = function (app, connectDB, transporter) {
             // Step 2: apply the restriction
             await driveClient.files.update({
                 fileId,
-                requestBody: { copyRequiresWriterPermission: true },
+                requestBody: { copyRequiresWriterPermission: boolValue },
                 fields: 'id,copyRequiresWriterPermission'
             });
 
@@ -108,7 +110,7 @@ module.exports = function (app, connectDB, transporter) {
             const updated = verification.data;
             console.log(`[Drive] After update: fileId=${fileId} copyRequiresWriterPermission=${updated.copyRequiresWriterPermission} canDownload=${updated.capabilities?.canDownload} canCopy=${updated.capabilities?.canCopy}`);
 
-            if (updated.copyRequiresWriterPermission !== true) {
+            if (updated.copyRequiresWriterPermission !== boolValue) {
                 // Restriction attempt did not take — warn but don't block playback
                 console.warn(`[Drive] Restriction was not confirmed for file ${fileId}. Continuing without blocking playback.`);
             }
@@ -600,6 +602,29 @@ module.exports = function (app, connectDB, transporter) {
         }
     });
 
+    // Delete Learner completely
+    app.delete('/api/classes/admin/learners/:id', async (req, res) => {
+        try {
+            const db = await connectDB();
+            const user = await db.collection('classes_users').findOne({ _id: new ObjectId(req.params.id) });
+            if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+            if (user.drivePermissionId && MAIN_FOLDER_ID) {
+                await revokeDriveAccess(MAIN_FOLDER_ID, user.drivePermissionId);
+            }
+
+            // Remove everything associated with this user
+            await db.collection('classes_users').deleteOne({ _id: user._id });
+            await db.collection('classes_sessions').deleteMany({ userId: user._id });
+            await db.collection('classes_progress').deleteMany({ userId: user._id });
+
+            res.json({ success: true, message: 'Learner completely removed' });
+        } catch (e) {
+            console.error(e);
+            res.status(500).json({ success: false, message: 'Server error' });
+        }
+    });
+
     // Get Categories (Admin)
     app.get('/api/classes/admin/categories', async (req, res) => {
         try {
@@ -715,16 +740,19 @@ module.exports = function (app, connectDB, transporter) {
     // Create Topic
     app.post('/api/classes/admin/topics', async (req, res) => {
         try {
-            const { title, description, categoryId, driveFileId, thumbnail, duration, order, isPublished } = req.body;
+            let { title, description, categoryId, driveFileId, thumbnail, duration, order, isPublished, disableDownload } = req.body;
+            
+            // Backward compatibility: default to true for existing payloads
+            if (disableDownload === undefined) disableDownload = true;
+            else disableDownload = !!disableDownload;
 
             if (!driveFileId) {
                 return res.status(400).json({ success: false, message: 'Drive file ID is required' });
             }
 
             // Apply and verify native Drive restrictions before creating the topic.
-            // Prevents topics from being created for unprotected files.
             try {
-                const driveFile = await enforceVideoRestrictions(driveFileId);
+                const driveFile = await enforceVideoRestrictions(driveFileId, disableDownload);
                 if (!driveFile || !driveFile.id) {
                     return res.status(400).json({ success: false, message: 'Unable to verify Google Drive video' });
                 }
@@ -740,6 +768,7 @@ module.exports = function (app, connectDB, transporter) {
             const topic = {
                 title, description, categoryId, driveFileId, thumbnail, duration,
                 order: parseInt(order) || 0, isPublished: !!isPublished,
+                disableDownload,
                 createdAt: new Date()
             };
             const result = await db.collection('classes_topics').insertOne(topic);
@@ -753,12 +782,17 @@ module.exports = function (app, connectDB, transporter) {
     // Update Topic
     app.put('/api/classes/admin/topics/:id', async (req, res) => {
         try {
-            const { title, description, categoryId, driveFileId, thumbnail, duration, order, isPublished } = req.body;
+            let { title, description, categoryId, driveFileId, thumbnail, duration, order, isPublished, disableDownload } = req.body;
+            
+            // Backward compatibility: default to true if undefined
+            if (disableDownload === undefined) disableDownload = true;
+            else disableDownload = !!disableDownload;
 
-            // If driveFileId is being changed/set, enforce restrictions on the new file
+            // If driveFileId is being changed/set, enforce restrictions on the new file.
+            // Also enforce if disableDownload flag is toggled on an existing file.
             if (driveFileId) {
                 try {
-                    await enforceVideoRestrictions(driveFileId);
+                    await enforceVideoRestrictions(driveFileId, disableDownload);
                 } catch (driveErr) {
                     console.error('enforceVideoRestrictions failed on update:', driveErr.message);
                     return res.status(400).json({
@@ -771,7 +805,7 @@ module.exports = function (app, connectDB, transporter) {
             const db = await connectDB();
             await db.collection('classes_topics').updateOne(
                 { _id: new ObjectId(req.params.id) },
-                { $set: { title, description, categoryId, driveFileId, thumbnail, duration, order: parseInt(order)||0, isPublished: !!isPublished, updatedAt: new Date() } }
+                { $set: { title, description, categoryId, driveFileId, thumbnail, duration, order: parseInt(order)||0, isPublished: !!isPublished, disableDownload, updatedAt: new Date() } }
             );
             res.json({ success: true, message: 'Topic updated' });
         } catch (e) {
