@@ -328,6 +328,8 @@ require('./webinars')(app, connectDB);
 // --- CAREER GUIDANCE ROUTES ---
 require('./career-guidance')(app, connectDB, sendEmail);
 
+
+
 // --- NEW ROUTE: Get Unique Subcategories ---
 app.get('/api/tech-posts/subcategories', async (req, res) => {
     try {
@@ -665,6 +667,8 @@ const transporter = nodemailer.createTransport({
     }
 });
 
+// --- CLASSES ROUTES ---
+require('./classes')(app, connectDB, transporter);
 
 // Helper to send generic email
 // Helper to send generic email
