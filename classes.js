@@ -57,6 +57,35 @@ module.exports = function (app, connectDB, transporter) {
         }
     }
 
+    // Helper: Apply and verify native Drive download/copy restrictions.
+    // Sets copyRequiresWriterPermission=true so viewers cannot download/copy/print.
+    // Idempotent: safe to call repeatedly on the same fileId.
+    async function enforceVideoRestrictions(fileId) {
+        if (!driveClient) throw new Error('Drive client not initialized');
+        if (!fileId) throw new Error('Drive file ID is required');
+
+        await driveClient.files.update({
+            fileId,
+            requestBody: { copyRequiresWriterPermission: true },
+            fields: 'id,name,copyRequiresWriterPermission,capabilities(canDownload,canCopy,canEdit)'
+        });
+
+        // Verify the restriction was actually applied by Google
+        const verification = await driveClient.files.get({
+            fileId,
+            fields: 'id,name,copyRequiresWriterPermission,capabilities(canDownload,canCopy,canEdit)'
+        });
+
+        const file = verification.data;
+        console.log(`[Drive restrictions] fileId=${fileId} copyRequiresWriterPermission=${file.copyRequiresWriterPermission} canDownload=${file.capabilities?.canDownload} canCopy=${file.capabilities?.canCopy}`);
+
+        if (file.copyRequiresWriterPermission !== true) {
+            throw new Error(`Google Drive restriction was not applied to file ${fileId}`);
+        }
+
+        return file;
+    }
+
     // Helper: Create folder
     async function createDriveFolder(folderName, parentFolderId) {
         if (!driveClient) throw new Error("Drive client not initialized");
@@ -158,9 +187,14 @@ module.exports = function (app, connectDB, transporter) {
         }
     });
 
-    // Middleware to check authentication
+    // Middleware to check authentication.
+    // Accepts token from Authorization header (Bearer) OR ?token= query param.
+    // The query-param form is required for iframe src URLs, which cannot send headers.
     const authMiddleware = async (req, res, next) => {
-        const token = req.headers.authorization?.split(' ')[1];
+        const headerToken = req.headers.authorization?.split(' ')[1];
+        const queryToken = req.query.token;
+        const token = headerToken || queryToken;
+
         if (!token) return res.status(401).json({ success: false, message: 'Unauthorized' });
 
         try {
@@ -268,20 +302,48 @@ module.exports = function (app, connectDB, transporter) {
             if (!video || !video.isPublished) return res.status(404).json({ success: false, message: 'Video not found' });
 
             const comments = await db.collection('classes_comments').find({ topicId: req.params.id }).sort({ createdAt: -1 }).toArray();
-            
+
             const categoryTopics = await db.collection('classes_topics')
                 .find({ categoryId: video.categoryId, isPublished: true })
                 .sort({ order: 1 })
                 .toArray();
 
-            res.json({ 
-                success: true, 
-                data: { 
-                    video, 
-                    comments, 
-                    remainingTopics: categoryTopics,
-                    userEmail: req.user.email 
-                } 
+            // Find progress for this specific video
+            const progressDoc = await db.collection('classes_progress').findOne({ userId: req.user._id, topicId: new ObjectId(req.params.id) });
+
+            // Sanitize: never expose driveFileId or internal Drive metadata to the learner.
+            // The frontend uses only the internal MongoDB _id to load the embed endpoint.
+            const safeVideo = {
+                _id: video._id,
+                title: video.title,
+                description: video.description,
+                categoryId: video.categoryId,
+                thumbnail: video.thumbnail,
+                duration: video.duration,
+                order: video.order,
+                isPublished: video.isPublished,
+                createdAt: video.createdAt,
+                progress: progressDoc || null
+            };
+
+            const safeTopics = categoryTopics.map(t => ({
+                _id: t._id,
+                title: t.title,
+                description: t.description,
+                thumbnail: t.thumbnail,
+                duration: t.duration,
+                order: t.order,
+                isPublished: t.isPublished
+            }));
+
+            res.json({
+                success: true,
+                data: {
+                    video: safeVideo,
+                    comments,
+                    remainingTopics: safeTopics,
+                    userEmail: req.user.email
+                }
             });
         } catch (e) {
             console.error(e);
@@ -289,21 +351,38 @@ module.exports = function (app, connectDB, transporter) {
         }
     });
 
-    // Embed endpoint to hide raw Drive URL from React UI
-    app.get('/api/classes/videos/:id/embed', async (req, res) => {
+    // Authenticated embed endpoint — requires active learner session.
+    // Never exposes Drive file ID, download URL, or credentials to the browser.
+    app.get('/api/classes/videos/:id/embed', authMiddleware, async (req, res) => {
         try {
-            // We can optionally verify a token via query parameter if we want stricter security, 
-            // but for simple obfuscation we just fetch the ID and redirect.
-            const db = await connectDB();
-            const video = await db.collection('classes_topics').findOne({ _id: new ObjectId(req.params.id) });
-            if (!video || !video.isPublished || !video.driveFileId) {
-                return res.status(404).send('Video not found');
+            if (req.user.status !== 'active') {
+                return res.status(403).json({ success: false, message: 'Access denied' });
             }
-            // Redirect to Google Drive preview URL.
-            // ?rm=minimal suppresses the Drive viewer top toolbar (pop-out, share, etc.)
+
+            const db = await connectDB();
+            const video = await db.collection('classes_topics').findOne({
+                _id: new ObjectId(req.params.id),
+                isPublished: true
+            });
+
+            if (!video || !video.driveFileId) {
+                return res.status(404).json({ success: false, message: 'Video not found' });
+            }
+
+            // Verify restriction is applied before serving the embed.
+            // This also acts as a liveness check on the Drive file.
+            const driveFile = await enforceVideoRestrictions(video.driveFileId);
+
+            if (!driveFile || driveFile.copyRequiresWriterPermission !== true) {
+                return res.status(403).json({ success: false, message: 'Video playback is currently unavailable' });
+            }
+
+            // Only after authentication + authorization + restriction verified:
+            // redirect to Drive preview. rm=minimal is a UI-only parameter.
             res.redirect(`https://drive.google.com/file/d/${video.driveFileId}/preview?rm=minimal`);
-        } catch (e) {
-            res.status(500).send('Server error');
+        } catch (error) {
+            console.error('Video embed error:', error);
+            res.status(500).json({ success: false, message: 'Unable to load video' });
         }
     });
 
@@ -462,7 +541,7 @@ module.exports = function (app, connectDB, transporter) {
     // Create Category
     app.post('/api/classes/admin/categories', async (req, res) => {
         try {
-            const { name, description, order, isPublished } = req.body;
+            const { name, description, banner, order, isPublished } = req.body;
             let folderId = null;
 
             if (MAIN_FOLDER_ID) {
@@ -475,7 +554,11 @@ module.exports = function (app, connectDB, transporter) {
 
             const db = await connectDB();
             const category = {
-                name, description, order: parseInt(order) || 0, isPublished: !!isPublished,
+                name,
+                description,
+                banner: banner || null,   // ImageKit URL for the category thumbnail
+                order: parseInt(order) || 0,
+                isPublished: !!isPublished,
                 driveFolderId: folderId,
                 createdAt: new Date()
             };
@@ -489,11 +572,13 @@ module.exports = function (app, connectDB, transporter) {
     // Update Category
     app.put('/api/classes/admin/categories/:id', async (req, res) => {
         try {
-            const { name, description, order, isPublished } = req.body;
+            const { name, description, banner, order, isPublished } = req.body;
             const db = await connectDB();
+            const updateFields = { name, description, order: parseInt(order) || 0, isPublished: !!isPublished, updatedAt: new Date() };
+            if (banner !== undefined) updateFields.banner = banner;  // preserve existing banner if not sent
             await db.collection('classes_categories').updateOne(
                 { _id: new ObjectId(req.params.id) },
-                { $set: { name, description, order: parseInt(order) || 0, isPublished: !!isPublished, updatedAt: new Date() } }
+                { $set: updateFields }
             );
             res.json({ success: true, message: 'Category updated' });
         } catch (e) {
@@ -558,6 +643,26 @@ module.exports = function (app, connectDB, transporter) {
     app.post('/api/classes/admin/topics', async (req, res) => {
         try {
             const { title, description, categoryId, driveFileId, thumbnail, duration, order, isPublished } = req.body;
+
+            if (!driveFileId) {
+                return res.status(400).json({ success: false, message: 'Drive file ID is required' });
+            }
+
+            // Apply and verify native Drive restrictions before creating the topic.
+            // Prevents topics from being created for unprotected files.
+            try {
+                const driveFile = await enforceVideoRestrictions(driveFileId);
+                if (!driveFile || !driveFile.id) {
+                    return res.status(400).json({ success: false, message: 'Unable to verify Google Drive video' });
+                }
+            } catch (driveErr) {
+                console.error('enforceVideoRestrictions failed on create:', driveErr.message);
+                return res.status(400).json({
+                    success: false,
+                    message: 'Unable to secure the Google Drive video. Please verify the Drive file and try again.'
+                });
+            }
+
             const db = await connectDB();
             const topic = {
                 title, description, categoryId, driveFileId, thumbnail, duration,
@@ -567,6 +672,7 @@ module.exports = function (app, connectDB, transporter) {
             const result = await db.collection('classes_topics').insertOne(topic);
             res.json({ success: true, data: { ...topic, _id: result.insertedId } });
         } catch (e) {
+            console.error('Create topic error:', e);
             res.status(500).json({ success: false, message: 'Server error' });
         }
     });
@@ -575,6 +681,20 @@ module.exports = function (app, connectDB, transporter) {
     app.put('/api/classes/admin/topics/:id', async (req, res) => {
         try {
             const { title, description, categoryId, driveFileId, thumbnail, duration, order, isPublished } = req.body;
+
+            // If driveFileId is being changed/set, enforce restrictions on the new file
+            if (driveFileId) {
+                try {
+                    await enforceVideoRestrictions(driveFileId);
+                } catch (driveErr) {
+                    console.error('enforceVideoRestrictions failed on update:', driveErr.message);
+                    return res.status(400).json({
+                        success: false,
+                        message: 'Unable to secure the Google Drive video. Please verify the Drive file and try again.'
+                    });
+                }
+            }
+
             const db = await connectDB();
             await db.collection('classes_topics').updateOne(
                 { _id: new ObjectId(req.params.id) },
@@ -582,6 +702,7 @@ module.exports = function (app, connectDB, transporter) {
             );
             res.json({ success: true, message: 'Topic updated' });
         } catch (e) {
+            console.error('Update topic error:', e);
             res.status(500).json({ success: false, message: 'Server error' });
         }
     });
