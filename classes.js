@@ -267,8 +267,18 @@ module.exports = function (app, connectDB, transporter) {
             }
 
             const db = await connectDB();
-            const categories = await db.collection('classes_categories').find({ isPublished: true }).sort({ order: 1 }).toArray();
-            const allVideos = await db.collection('classes_topics').find({ isPublished: true }).toArray();
+            const allowed = req.user.allowedCategories;
+            
+            let categories = await db.collection('classes_categories').find({ isPublished: true }).sort({ order: 1 }).toArray();
+            if (allowed) {
+                categories = categories.filter(c => allowed.includes(c._id.toString()));
+            }
+
+            const allowedCatIds = categories.map(c => c._id.toString());
+            let allVideos = await db.collection('classes_topics').find({ isPublished: true }).toArray();
+            // Only return videos for allowed categories
+            allVideos = allVideos.filter(v => allowedCatIds.includes(v.categoryId));
+
             const progressDocs = await db.collection('classes_progress').find({ userId: req.user._id }).toArray();
 
             const completedVideos = progressDocs.filter(p => p.completed).length;
@@ -327,7 +337,11 @@ module.exports = function (app, connectDB, transporter) {
         if (req.user.status !== 'active') return res.status(403).json({ success: false, message: 'Access denied' });
         try {
             const db = await connectDB();
-            const categories = await db.collection('classes_categories').find({ isPublished: true }).sort({ order: 1 }).toArray();
+            let categories = await db.collection('classes_categories').find({ isPublished: true }).sort({ order: 1 }).toArray();
+            const allowed = req.user.allowedCategories;
+            if (allowed) {
+                categories = categories.filter(c => allowed.includes(c._id.toString()));
+            }
             res.json({ success: true, data: categories });
         } catch (e) {
             res.status(500).json({ success: false, message: 'Server error' });
@@ -337,6 +351,12 @@ module.exports = function (app, connectDB, transporter) {
     // Get Topics for a Category
     app.get('/api/classes/categories/:id/topics', authMiddleware, async (req, res) => {
         if (req.user.status !== 'active') return res.status(403).json({ success: false, message: 'Access denied' });
+        
+        const allowed = req.user.allowedCategories;
+        if (allowed && !allowed.includes(req.params.id)) {
+            return res.status(403).json({ success: false, message: 'Access to this category denied' });
+        }
+
         try {
             const db = await connectDB();
             const topics = await db.collection('classes_topics')
@@ -368,7 +388,10 @@ module.exports = function (app, connectDB, transporter) {
             const video = await db.collection('classes_topics').findOne({ _id: new ObjectId(req.params.id) });
             if (!video || !video.isPublished) return res.status(404).json({ success: false, message: 'Video not found' });
 
-            const comments = await db.collection('classes_comments').find({ topicId: req.params.id }).sort({ createdAt: -1 }).toArray();
+            const allowed = req.user.allowedCategories;
+            if (allowed && !allowed.includes(video.categoryId)) {
+                return res.status(403).json({ success: false, message: 'Access to this video denied' });
+            }
 
             const categoryTopics = await db.collection('classes_topics')
                 .find({ categoryId: video.categoryId, isPublished: true })
@@ -407,7 +430,6 @@ module.exports = function (app, connectDB, transporter) {
                 success: true,
                 data: {
                     video: safeVideo,
-                    comments,
                     remainingTopics: safeTopics,
                     userEmail: req.user.email
                 }
@@ -437,6 +459,11 @@ module.exports = function (app, connectDB, transporter) {
 
             if (!video) {
                 return res.status(404).json({ success: false, message: 'Video not found' });
+            }
+
+            const allowed = req.user.allowedCategories;
+            if (allowed && !allowed.includes(video.categoryId)) {
+                return res.status(403).json({ success: false, message: 'Access to this video denied' });
             }
 
             if (!video.driveFileId) {
@@ -532,10 +559,39 @@ module.exports = function (app, connectDB, transporter) {
         }
     });
 
+    // Get Feedback
+    app.get('/api/classes/admin/feedback', async (req, res) => {
+        try {
+            const db = await connectDB();
+            const comments = await db.collection('classes_comments').find().sort({ createdAt: -1 }).toArray();
+            const topics = await db.collection('classes_topics').find().toArray();
+            const categories = await db.collection('classes_categories').find().toArray();
+
+            const feedbackData = comments.map(c => {
+                const topic = topics.find(t => t._id.toString() === c.topicId);
+                const category = topic ? categories.find(cat => cat._id.toString() === topic.categoryId) : null;
+                
+                return {
+                    _id: c._id,
+                    email: c.userEmail,
+                    date: c.createdAt,
+                    question: c.content,
+                    courseName: category ? category.name : 'Unknown Course',
+                    topicTitle: topic ? topic.title : 'Unknown Topic'
+                };
+            });
+
+            res.json({ success: true, data: feedbackData });
+        } catch (e) {
+            console.error('Fetch Feedback Error:', e);
+            res.status(500).json({ success: false, message: 'Server error' });
+        }
+    });
+
     // Add & Provide Access
     app.post('/api/classes/admin/learners/add-access', async (req, res) => {
         try {
-            const { email } = req.body;
+            const { email, allowedCategories } = req.body;
             if (!email) return res.status(400).json({ success: false, message: 'Email required' });
 
             const emailLower = email.toLowerCase().trim();
@@ -559,7 +615,12 @@ module.exports = function (app, connectDB, transporter) {
             if (user) {
                 await db.collection('classes_users').updateOne(
                     { _id: user._id },
-                    { $set: { status: 'active', drivePermissionId: permissionId, approvedAt: new Date() } }
+                    { $set: { 
+                        status: 'active', 
+                        drivePermissionId: permissionId, 
+                        approvedAt: new Date(),
+                        allowedCategories: Array.isArray(allowedCategories) ? allowedCategories : []
+                    } }
                 );
             } else {
                 await db.collection('classes_users').insertOne({
@@ -568,13 +629,41 @@ module.exports = function (app, connectDB, transporter) {
                     role: 'learner',
                     createdAt: new Date(),
                     approvedAt: new Date(),
-                    drivePermissionId: permissionId
+                    drivePermissionId: permissionId,
+                    allowedCategories: Array.isArray(allowedCategories) ? allowedCategories : []
                 });
             }
 
             res.json({ success: true, message: 'Access provided successfully' });
         } catch (e) {
             console.error(e);
+            res.status(500).json({ success: false, message: 'Server error' });
+        }
+    });
+
+    // Update Access (allowedCategories) for existing learner
+    app.put('/api/classes/admin/learners/:id/access', async (req, res) => {
+        try {
+            const { allowedCategories } = req.body;
+            if (!Array.isArray(allowedCategories)) {
+                return res.status(400).json({ success: false, message: 'allowedCategories must be an array' });
+            }
+
+            const db = await connectDB();
+            const user = await db.collection('classes_users').findOne({ _id: new ObjectId(req.params.id) });
+            
+            if (!user) {
+                return res.status(404).json({ success: false, message: 'User not found' });
+            }
+
+            await db.collection('classes_users').updateOne(
+                { _id: user._id },
+                { $set: { allowedCategories } }
+            );
+
+            res.json({ success: true, message: 'Access updated successfully' });
+        } catch (e) {
+            console.error('Update Access Error:', e);
             res.status(500).json({ success: false, message: 'Server error' });
         }
     });
